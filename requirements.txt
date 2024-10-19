@@ -15,6 +15,7 @@ colorama==0.4.6
 contourpy==1.2.1
 cycler==0.12.1
 distro==1.9.0
+dnspython==2.7.0
 fastapi==0.112.1
 ffmpy==0.4.0
 filelock==3.15.4
@@ -63,6 +64,7 @@ pydantic_core==2.20.1
 pydeck==0.9.1
 pydub==0.25.1
 Pygments==2.18.0
+pymongo==4.10.1
 pyparsing==3.1.2
 python-dateutil==2.9.0.post0
 python-dotenv==1.0.1
