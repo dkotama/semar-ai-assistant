@@ -1,243 +1,332 @@
+import os
 import streamlit as st
+import tiktoken
 from langchain_core.messages import HumanMessage, AIMessage
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langchain_core.output_parsers import StrOutputParser
 from dotenv import load_dotenv
+from pymongo import MongoClient
+from bson.objectid import ObjectId
+from datetime import datetime
+from pytz import timezone
 
 
+# Load environment variables
 load_dotenv()
 
-prompt_version = "v1.3"
+# Load the MongoDB client
+MONGODB_URI = os.getenv("MONGODB_URI")
 
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = [
-        AIMessage(f"""
-            Hello, I am SEMAR-Bot! your IoT setup assistant. \nWhat kind of project are you planning to build today?.\nYou can start by saying "I wan't to make IoT for measure my temperature"
-            \n\n\n_Loaded prompt version: {prompt_version}_
-            """)
-    ]
+# MongoDB Setup
+client = MongoClient(MONGODB_URI)
+db = client["semar_bot_db"]
+sessions_collection = db["sessions"]
 
+prompt_version = "v1.4"
+current_model = "gpt-4o"
+
+# Get Current Time Functions
+def get_current_time():
+    return datetime.now(tz=timezone('Asia/Tokyo')).strftime("%Y-%m-%d %H:%M:%S")
+
+
+# Set up the page
 st.set_page_config(page_title="Semar-Bot", page_icon=":robot:")
+st.title("Semar-Bot")
 
+# Step 1: Student ID and Name Input
+if 'student_info' not in st.session_state:
+    st.session_state['student_info'] = {}
 
+if not st.session_state['student_info']:
+    with st.form('student_form'):
+        st.write("Masukkan NIM anda dan Nama anda:")
+        student_id = st.text_input('NIM')
+        student_name = st.text_input('Nama')
+        submitted = st.form_submit_button('Start Chat')
 
-st.title("Langchain Streamlit") 
+        if submitted:
+            if student_id.strip() != "" and student_name.strip() != "":
+                st.session_state['student_info'] = {
+                    'student_id': student_id.strip(),
+                    'student_name': student_name.strip()
+                }
+                st.success('Informasi anda disimpan! Klik start sekali lagi sampai loading di pojok kanan bergerak 🏃🚴...')
+            else:
+                st.error('Harus isi kedua informasi.')
+    st.stop()  # Stop execution until the student info is provided
 
-# get response
+# Step 2: Create a New Session in MongoDB
+if 'session_id' not in st.session_state:
+    # Create a new session document in MongoDB
+    session_data = {
+        'student_id': st.session_state['student_info']['student_id'],
+        'created_at': get_current_time(),
+        'model': current_model,
+        'prompt_version': prompt_version,
+        'chat_history': []
+    }
+    session = sessions_collection.insert_one(session_data)
+    st.session_state['session_id'] = str(session.inserted_id)
+
+# Step 3: Initialize Chat History
+if 'chat_history' not in st.session_state:
+    # Fetch the session from MongoDB
+    session = sessions_collection.find_one({'_id': ObjectId(st.session_state['session_id'])})
+    if session and 'chat_history' in session and len(session['chat_history']) > 0:
+        st.session_state['chat_history'] = session['chat_history']
+    else:
+        st.session_state['chat_history'] = [
+            {
+                'role': 'assistant',
+                'content': f"""
+                        Halo! {st.session_state['student_info']['student_name']}! Saya Semar-Bot, asisten Setup IoT mu. Mari mulai dengan setup proyek IoT Anda.
+                        Apa jenis proyek IoT yang sedang Anda kerjakan hari ini? Anda bisa mulai dengan menyatakan ide Anda untuk proyek tersebut.
+                        sebagai contoh, "Saya ingin membuat pemanas air berbasis IoT, dengan ESP32 sebagai board mikro, dan DHT22 sebagai sensor suhu."
+                    _Loaded prompt version: {prompt_version}_
+                    """
+            }
+        ]
+# Step 4: Define the get_response Function
 def get_response(query, chat_history):
+
     template = """
-            You are an IoT Setup Assistant. Your sole focus is assisting with IoT projects. Please skip any topics unrelated to IoT.
+        Context:  
+        You are an **IoT Setup Assistant**, focused solely on assisting with IoT projects. Your goal is to guide the user through gathering the **PROJECT REQUIREMENTS** and then assist in setting up the **PROJECT HARDWARE** and **CONNECTIVITY**. You will also suggest necessary **components** if the user has not stated them. 
 
-            Your task is to help the user create a complete IoT Project Document by conducting an interview.  
-            You will gather the required specifications and ensure that all necessary details are provided before proceeding.
+        You will:
+        - **Detect missing requirements** and offer advice on hardware automatically, suggesting suitable components.
+        - **Automatically suggest sensor connectivity** based on the sensor type, even if the user has not specified it.
+        - If **additional hardware** is needed to complete the project, suggest it without waiting for further input.
 
-            You must track the conversation using the **Chat History** to determine what specifications have already been provided, and which are still pending. Always refer to the chat history before asking questions, to avoid asking for information that has already been confirmed.
+        If the user speaks in **Bahasa Indonesia**, respond in **Bahasa Indonesia**. If the user speaks in **English**, respond in **English**.
 
-            For required specifications, you will continue asking the user until the information is given. For optional specifications, proceed immediately if provided, or use defaults where applicable.
+        ---
 
-            Start by asking for the required specifications, while leveraging the chat history to maintain continuity.
+        ### Task Flow:
 
-            ---
+        1. **Gather Project Requirements**:  
+        Use the **PROJECT REQUIREMENT TEMPLATE** to gather required and optional specifications from the user. If specifications are missing, the AI should automatically suggest **default options** or **suitable components**.
+        
+        2. **Proactively Confirm Specifications**:  
+        Use **chat history** to confirm already provided specifications. For any missing items, suggest defaults and explain why those are recommended. Avoid repeating questions.
 
-            User's Query:  
-            {query}
+        3. **Assist with Project Setup**:  
+        Guide the user through the project setup, starting with **hardware**. Automatically recommend hardware and sensors if the user hasn't provided specific details, and adjust based on **environmental constraints**.
 
-            Chat History:  
-            {chat_history}
+        ---
 
-            ---
+        ### PROJECT REQUIREMENT TEMPLATE (Responsive Version)
 
-            ### Interview Steps:
+        **Part 1: Project Idea**  
+        1. **Idea (Required)**:   
+        What is your IoT project about? Example: "An IoT-based water heater."  
+        - AI will automatically suggest relevant **hardware**, **sensors**, and **network components** based on the project idea.  
+        ⌛ _Waiting for user input_  
+        (Track via chat history if already confirmed)
 
-            1. **Idea (Required):**  
-            Please state your idea for the IoT project. For example, "I want to make an IoT-based water heater."
-            - If already stated, confirm from the chat history.
+        **Part 2: Hardware Setup**  
+        2. **Processing Board (Required)**:  
+        Choose between **Arduino** or **Raspberry Pi**.  
+        - If unspecified, suggest **Arduino** as a default or recommend the best option based on the project type.  
+        ⌛ _Waiting for user input_
 
-            2. **Hardware Setup:**
+        3. **Sensor Connectivity (Auto-detect)**:  
+        The AI will automatically recommend the correct connectivity (UART, GPiO, I2C) based on the sensors used.  
+        - AI will **suggest the appropriate connection type** based on the sensor's specs.  
+        - If the user specifies a sensor, automatically recommend its proper connectivity.  
+        ⌛ _AI will suggest based on sensor input or defaults._
 
-            - **Processing Board (Required, default: Arduino):**  
-                Choose between Arduino or Raspberry Pi.
-                - If already stated, confirm from the chat history.
+        4. **Network Connectivity (Required)**:  
+        Choose between **GSM** or **WiFi**.  
+        - If unspecified, suggest **WiFi** by default.  
+        - AI will suggest network modules based on project requirements.  
+        ⌛ _Waiting for user input_
 
-            - **Sensor Connectivity (Required, default: GPiO):**  
-                Choose between UART, GPiO, or i2C. Please also suggest specific sensor models or brands based on the project idea.
-                - If already stated, confirm from the chat history.
+        5. **Communication Protocol (Required)**:  
+        Choose between **HTTP**, **MQTT**, or **WebSocket**.  
+        - AI will suggest **HTTP** as default or recommend the best protocol based on the project type.  
+        ⌛ _Waiting for user input_
 
-            - **Network Connectivity (Required, default: Wifi):**  
-                Choose between GSM or Wifi. Please suggest specific network modules or components based on the project idea.
-                - If already stated, confirm from the chat history.
+        **Part 3: Environmental Constraints (Optional)**  
+        6. **Limitation** (Optional):  
+        Specify any limitations, such as "Max temperature: 100°C."  
+        - If not stated, AI can suggest defaults based on common constraints for similar projects.  
+        ⌛ _Optional_
 
-            - **Communication Protocol (Required, default: HTTP):**  
-                Choose between MQTT, Websocket, or HTTP. Recommend specific libraries or components that are suitable for the chosen communication protocol.
-                - If already stated, confirm from the chat history.
+        7. **Constraints** (Optional):  
+        Specify any constraints, such as "Data must be sent every 2 seconds."  
+        ⌛ _Optional_
 
-            3. **Environment Constraints:**
-            - **Limitation (Optional):**  
-                Specify any limitations, such as "Maximum heat will be 100 degrees C."
-                - If already stated, confirm from the chat history.
+        8. **Object Distance** (Optional):  
+        Specify any object distance constraints, such as "No distance between water and heat sensor."  
+        ⌛ _Optional_
 
-            - **Constraint (Optional):**  
-                Specify any constraints, such as "Data must be sent every 2 seconds."
-                - If already stated, confirm from the chat history.
+        ---
 
-            - **Object Distance (Optional):**  
-                Specify any object distance, such as "No distance between water and heat sensor."
-                - If already stated, confirm from the chat history.
+        ### PROJECT SETUP FLOW (With Responsive Assistance)
 
-            ---
+        Once the project requirements are gathered and confirmed:
 
-            ### Brand and Model Suggestions:
+        **Part 1: Hardware Setup**  
+        - Assist the user with connecting and setting up the hardware (board, sensors).  
+        - **Proactively suggest hardware** if missing components are identified during setup.  
+        - Provide coding examples and library suggestions for hardware integration.  
+        - **Auto-suggest sensor connectivity** based on sensor selection. Example: If a temperature sensor requires I2C, suggest that and provide coding examples.
 
-            Based on the user's IoT idea and the specifications collected, suggest appropriate hardware, sensors, and network components, including specific brands and models.
+        **Part 2: Connectivity & Communication Setup**  
+        - Guide the user through integrating the network module and setting up the communication protocol.  
+        - Provide coding examples and libraries for communication protocols (e.g., HTTP, MQTT).  
+        - Ensure the setup aligns with the project idea (e.g., if a real-time project, suggest MQTT for faster data transmission).
 
-            For example:
-            - **Sensors:**  
-            For temperature sensing in a water heater project, consider using the **DS18B20 Waterproof Temperature Sensor** or the **DHT22 Humidity and Temperature Sensor**. Here's how you can integrate these models with the Arduino or Raspberry Pi.
+        **Part 3: Project Confirmation & Final Record**  
+        - Once the setup is confirmed, generate a **Final Record** summarizing the setup, including hardware, sensors, network components, and communication protocols.
 
-            - **Network Modules:**  
-            For WiFi connectivity, consider using the **ESP8266 WiFi Module** or the **ESP32 Development Board**, both of which are compatible with Arduino and Raspberry Pi.
+        ---
 
-            - **Communication Protocol:**  
-            If the user selects MQTT, recommend using the **PubSubClient library** for Arduino or the **paho-mqtt library** for Raspberry Pi.
+        **Final Record Format Example**  
+        - **Finished at:** {current_time}  
+        - **Board:** Arduino  
+        - **Sensors:** DHT22, DS18B20  
+        - **Network:** WiFi  
+        - **Communication:** MQTT  
+        - **Specification Changelog:**  
+        - Project: IoT-based water heater  
+        - Board: User chose Arduino  
+        - Network: WiFi chosen  
+        - Sensor: Changed from DHT11 to DHT22
 
-            ---
+        ---
 
-            ### Status Display:
+        USER QUERY:  
+        {query}
 
-            If a specification is confirmed, display it like this:
-            1. **Idea (Confirmed)** ✅  
-            (Confirmed from Chat History)
+        CHAT HISTORY:  
+        {chat_history}
 
-            If still waiting or unclear, display it like this:
-            1. **Idea (Waiting for Confirmation)** ⌛  
-            (Still waiting for user input)
+        ---
 
-            Use the chat history to accurately track the status of each specification.
+        """
+      # Get the current system time
+    current_time =  get_current_time()
 
-            ---
-
-            ### Proceeding to Document Generation:
-
-            Once all required specifications are gathered, confirm with the user if they are ready to generate the IoT Project Document by typing "Proceed". If any required information is missing, continue to ask for it until provided.
-
-            ---
-
-            ### IoT Project Document Format:
-
-            Once all required information is collected, look from your knowledge base how to integrate:
-            - Correct sensors (specific brands, types, and models) according to the project idea.
-            - Correct processing board (brand and model) according to the project idea.
-            - Correct network connectivity components and integration methods.
-            - Correct communication protocols and libraries required for implementation.
-
-            The project document will be generated in this format:
-
-            ---
-
-            ### IoT Project Document:
-
-            1. **IoT Idea:** (State the confirmed idea from the user based on the chat history.)
-            2. **Hardware Setup:**
-            1. **Processing Board:** (State the confirmed processing board. Suggest a specific model such as Arduino Uno or Raspberry Pi 4.)
-            2. **Sensor Connectivity:** (State the confirmed sensor connectivity and list specific sensor models, such as DS18B20 or DHT22.)
-            3. **Network Connectivity:** (State the confirmed network connectivity and recommend specific modules such as ESP8266 or ESP32.)
-            4. **Communication Protocol:** (Describe the chosen communication protocol, such as MQTT, and recommend libraries like PubSubClient or paho-mqtt.)
-
-            3. **Environment Constraints:**
-            1. **Limitation:** (State any limitations provided by the user.)
-            2. **Constraint:** (State any constraints provided by the user.)
-            3. **Object Distance:** (State any object distance provided by the user.)
-
-            ---
-
-            ### Steps to Integrate:
-
-            Provide general steps based on typical IoT projects:
-            1. Step 1: Install and configure the processing board (e.g., Arduino Uno or Raspberry Pi 4).
-            2. Step 2: Connect the sensors to the processing board based on the chosen connectivity (e.g., GPiO, UART, or i2C). Provide detailed instructions on wiring and integration with the sensors like DS18B20 or DHT22.
-            3. Step 3: Set up network connectivity (e.g., using ESP8266 or ESP32) and ensure the board can communicate with the network.
-            4. Step 4: Implement the communication protocol (e.g., MQTT via PubSubClient or paho-mqtt) and test data transmission.
-
-            ### Code on the Hardware:
-
-            Provide generic code snippets based on the hardware setup and communication protocol:
-            1. Basic code to read sensor data from specific sensors (e.g., DS18B20, DHT22).
-            2. Code to establish network connectivity using the selected module (e.g., ESP8266 or ESP32).
-            3. Code to implement the chosen communication protocol (e.g., MQTT, WebSocket, or HTTP).
-            4. Code to manage timing and data transmission intervals.
-
-            ---
-
-            You should continue refining the project document as you gather more specifications or user input.
-
-            """
-
-
-    # required_specifications = {
-    #     "idea": "IoT project idea",
-    #     "processing_board": "processing board choice (Arduino or Raspberry Pi), default Arduino",
-    #     "sensor_connectivity": "sensor connectivity (UART, GPiO, i2C), default i2c",
-    #     "network_connectivity": "network connectivity (Wifi or GSM), default Wifi",
-    #     "communication_protocol": "communication protocol (MQTT, HTTP, or Websocket), default HTTP"
-    # }
-
-    # missing_specs =  [spec for spec, desc in required_specifications.items() 
-    #                  if desc.lower() not in ' '.join(str(msg.content).lower() for msg in chat_history)]
-
-    # if missing_specs:
-    #     missing_specs_string= ", ".join(required_specifications[spec] for spec in missing_specs)
-    #     return f"Missing specifications: {missing_specs_string}. Please provide the missing details."
-
+    # Create the prompt
     prompt = ChatPromptTemplate.from_template(template)
 
-    llm = ChatOpenAI(model_name="gpt-4o")
+    llm = ChatOpenAI(model_name=current_model)  # Adjust the model name as needed
 
     chain = prompt | llm | StrOutputParser()
 
-    return chain.invoke({
-        "chat_history": chat_history, 
-        "query": query
+    # Convert chat history to the format expected by the chain
+    formatted_chat_history = []
+    for msg in chat_history:
+        if msg['role'] == 'user':
+            formatted_chat_history.append(HumanMessage(content=msg['content']))
+        else:
+            formatted_chat_history.append(AIMessage(content=msg['content']))
+
+    # Generate the response
+    response = chain.invoke({
+        "chat_history": formatted_chat_history,
+        "query": query,
+        "current_time": current_time  # Pass the current time to the prompt
     })
 
+     # Token Counting
+    encoding = tiktoken.encoding_for_model(current_model)  # Use the appropriate model name
 
+    # Prepare the full prompt text
+    # Include the formatted chat history and the query
+    full_prompt_messages = []
+
+    # Add the system prompt (if any)
+    full_prompt_messages.append(template)
+
+    # Add the chat history messages
+    for msg in formatted_chat_history:
+        role = "User" if isinstance(msg, HumanMessage) else "Assistant"
+        full_prompt_messages.append(f"{role}: {msg.content}")
+
+    # Add the user's query
+    full_prompt_messages.append(f"User: {query}")
+
+    # Combine all messages into a single string
+    full_prompt_text = "\n".join(full_prompt_messages)
+
+    # Count tokens in the input (prompt + chat history + query)
+    input_token_count = len(encoding.encode(full_prompt_text))
+
+    # Count tokens in the assistant's response
+    output_token_count = len(encoding.encode(response))
+
+    # Return response and token counts
+    return response, input_token_count, output_token_count
+
+# Step 5: Display the Conversation
 # Conversation
-for message in st.session_state.chat_history:
-    if isinstance(message, HumanMessage):
+for message in st.session_state['chat_history']:
+    if message['role'] == 'user':
         with st.chat_message("Human"):
-            st.markdown(message.content)
+            st.markdown(message['content'])
     else:
         with st.chat_message("AI"):
-            st.markdown(message.content)
+            st.markdown(message['content'])
 
+# Step 6: Handle User Input and Save to MongoDB
+# User input
+# User input
+user_query = st.chat_input("Pesan Anda:")
 
+if user_query is not None and user_query.strip() != "":
+    # Token count for user message
+    encoding = tiktoken.encoding_for_model(current_model)
+    user_token_count = len(encoding.encode(user_query))
 
+    # Append user message to chat history
+    user_message = {
+        'role': 'user',
+        'content': user_query,
+        'token_count': user_token_count
+    }
+    st.session_state['chat_history'].append(user_message)
 
-# user input
-user_query = st.chat_input("Your message:")
-
-# render user input and ai response
-if user_query is not None and user_query != "":
-    st.session_state.chat_history.append(HumanMessage(user_query))
     with st.chat_message("Human"):
         st.markdown(user_query)
 
+    # Get AI response and token counts
+    ai_response, input_token_count, output_token_count = get_response(user_query, st.session_state['chat_history'])
+
+    # Token count for AI message
+    ai_token_count = output_token_count
+
+    # Append AI message to chat history
+    ai_message = {
+        'role': 'assistant',
+        'content': ai_response,
+        'token_count': ai_token_count
+    }
+    st.session_state['chat_history'].append(ai_message)
 
     with st.chat_message("AI"):
-        ai_response = get_response(user_query, st.session_state.chat_history)
         st.markdown(ai_response)
 
-    st.session_state.chat_history.append(AIMessage(ai_response))
-
-
-
-
-
-
-
-
-
-
-
-
-
+    # Update chat history and token counts in MongoDB
+    sessions_collection.update_one(
+        {'_id': ObjectId(st.session_state['session_id'])},
+        {
+            '$set': {'chat_history': st.session_state['chat_history']},
+            '$inc': {
+                'total_input_tokens': input_token_count,
+                'total_output_tokens': output_token_count
+            },
+            '$push': {
+                'token_usage': {
+                    'timestamp': get_current_time(),
+                    'input_tokens': input_token_count,
+                    'output_tokens': output_token_count,
+                    'total_tokens': input_token_count + output_token_count
+                }
+            }
+        }
+    )
