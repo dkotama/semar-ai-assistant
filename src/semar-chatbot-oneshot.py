@@ -24,7 +24,7 @@ db = client["semar_bot_db"]
 sessions_collection = db["sessions"]
 
 prompt_version = "v1.6"
-current_model = "gpt-4o"
+current_model = "gpt-4o-mini"
 
 # Get Current Time Functions
 def get_current_time():
