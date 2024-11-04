@@ -195,7 +195,7 @@ def get_response(query, chat_history):
 
     prompt = ChatPromptTemplate.from_template(template)
 
-    llm = ChatOpenAI(model_name="gpt-4o")
+    llm = ChatOpenAI(model_name="gpt-4o-mini")
 
     chain = prompt | llm | StrOutputParser()
 
